@@ -248,6 +248,20 @@ class UInt16Spec(QTensorConfig):
     ):
         super().__init__(symmetric, scale_type, calibration_method, quant_granularity, data_type)
 
+class XInt16Spec(Int16Spec):
+    """
+    Quantization specification for int16 tensors with power-of-2 scaling.
+    """
+
+    def __init__(
+        self,
+        symmetric: bool = True,
+        scale_type: ScaleType = ScaleType.PowerOf2,
+        calibration_method: CalibMethod = CalibMethod.MinMSE,
+        quant_granularity: QuantGranularity = QuantGranularity.Tensor,
+        data_type: type[BaseDataType] = Int16,
+    ):
+        super().__init__(symmetric, scale_type, calibration_method, quant_granularity, data_type)
 
 class Int32Spec(QTensorConfig):
     """

@@ -91,6 +91,7 @@ from quark.onnx.quantization.config.spec import (
     UInt16Spec,
     UInt32Spec,
     XInt8Spec,
+    XInt16Spec,
 )
 from quark.onnx.quantization.quant_utils import ExtendedQuantFormat, ExtendedQuantType, VitisQuantFormat, VitisQuantType
 from quark.onnx.quantization.quantize import quantize_dynamic, quantize_static
@@ -138,6 +139,7 @@ __all__ = [
     "UInt8Spec",
     "XInt8Spec",
     "Int16Spec",
+    "XInt16Spec",
     "UInt16Spec",
     "Int32Spec",
     "UInt32Spec",
