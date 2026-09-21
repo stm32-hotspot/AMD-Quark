@@ -80,74 +80,114 @@ class Optimizer:
             if bn_gamma is not None:
                 multiplier = bn_gamma / np.sqrt(bn_mv + bn_epsilon)
             else:
-                multiplier = 1 / np.sqrt(bn_mv + bn_epsilon)
-
-            folded_conv_kernel = multiplier
-            folded_conv_bias = bn_beta + (-bn_mm) * multiplier
-            return folded_conv_kernel, folded_conv_bias
+                multiplier = 1.0 / np.sqrt(bn_mv + bn_epsilon)
+            weights = multiplier  # shape (C,) — will be reshaped per rank
+            bias = bn_beta + (-bn_mm) * multiplier if bn_beta is not None else (-bn_mm) * multiplier
+            return weights, bias
 
         self.op_types_to_quantize.append("BatchNormalization")
         nodes_to_remove: list[NodeProto] = []
         init_to_remove: list[str] = []
         onnx_model = ONNXModel(self.model)
         init_name = onnx_model.get_initializer_name_set()
+
         for node in onnx_model.model.graph.node:
-            if node.op_type == "BatchNormalization" and self.should_quantize_node(node):
-                input_name = node.input[0]
-                input_shape: list[str] = []
-                for input_info in onnx_model.model.graph.value_info:
-                    if input_info.name == input_name:
-                        input_shape = [dim.dim_value for dim in input_info.type.tensor_type.shape.dim]
-                if len(node.input) == 5 and len(input_shape) == 4:
-                    bn_epsilon = next((attr.f for attr in node.attribute if attr.name == "epsilon"), 1e-10)
+            if node.op_type != "BatchNormalization" or not self.should_quantize_node(node):
+                continue
+            if len(node.input) != 5:
+                continue
 
-                    missing_initializer_names = ", ".join(
-                        f"{name}" for i, name in enumerate(node.input[1:]) if name not in init_name
+            input_name = node.input[0]
+            input_shape = None
+            for info in onnx_model.model.graph.value_info:
+                if info.name == input_name:
+                    input_shape = [dim.dim_value for dim in info.type.tensor_type.shape.dim]
+                    break
+
+            if input_shape is None:
+                # No shape info — silently skip rather than warning.
+                continue
+
+            if len(input_shape) not in (3, 4):
+                # Unsupported rank; delegate to original warning path below.
+                logger.warning(
+                    f"Fail to convert bn {node.name} to conv because BatchNormalization's "
+                    f"input rank {len(input_shape)} is not supported (expected 3 or 4)."
+                )
+                continue
+
+            missing = ", ".join(n for n in node.input[1:] if n not in init_name)
+            if missing:
+                logger.warning(
+                    f"Skip converting bn to conv for node '{node.name}': "
+                    f"missing initializer(s): {missing}."
+                )
+                continue
+
+            bn_epsilon = next((a.f for a in node.attribute if a.name == "epsilon"), 1e-10)
+            bn_gamma = onnx.numpy_helper.to_array(onnx_model.get_initializer(node.input[1]))
+            bn_beta  = onnx.numpy_helper.to_array(onnx_model.get_initializer(node.input[2]))
+            bn_mm    = onnx.numpy_helper.to_array(onnx_model.get_initializer(node.input[3]))
+            bn_mv    = onnx.numpy_helper.to_array(onnx_model.get_initializer(node.input[4]))
+
+            try:
+                w, b = _get_folded_conv_weights(bn_gamma, bn_beta, bn_mm, bn_mv, bn_epsilon)
+                num_ch = bn_mm.shape[0]
+
+                if len(input_shape) == 4:
+                    # 2D: depthwise Conv2d(1×1) — matches original quark logic.
+                    w_tensor = onnx.numpy_helper.from_array(
+                        w.reshape(num_ch, 1, 1, 1).astype(np.float32),
+                        name=node.output[0] + "_bn2conv_w",
                     )
-                    if missing_initializer_names:
-                        logger.warning(
-                            f"Skip converting bn to conv for node '{node.name}': missing initializer(s): {missing_initializer_names}."
-                        )
-                        continue
-
-                    gamma_init = onnx_model.get_initializer(node.input[1])
-                    bn_gamma = onnx.numpy_helper.to_array(gamma_init)
-                    beta_init = onnx_model.get_initializer(node.input[2])
-                    bn_beta = onnx.numpy_helper.to_array(beta_init)
-                    mm_init = onnx_model.get_initializer(node.input[3])
-                    bn_mm = onnx.numpy_helper.to_array(mm_init)
-                    mv_init = onnx_model.get_initializer(node.input[4])
-                    bn_mv = onnx.numpy_helper.to_array(mv_init)
-
-                    try:
-                        weights, bias = _get_folded_conv_weights(bn_gamma, bn_beta, bn_mm, bn_mv, bn_epsilon)
-                        num_channel = bn_mm.shape[0]
-                        weights = weights.reshape([num_channel, 1, 1, 1])
-                        weights_tensor = onnx.numpy_helper.from_array(weights, name=node.output[0] + "weights")
-                        bias_tensor = onnx.numpy_helper.from_array(bias, name=node.output[0] + "bias")
-                        onnx_model.model.graph.initializer.extend([weights_tensor, bias_tensor])
-                        new_node = onnx.helper.make_node(
-                            "Conv",
-                            inputs=[node.input[0], node.output[0] + "weights", node.output[0] + "bias"],
-                            outputs=[node.output[0]],
-                            group=num_channel,
-                            kernel_shape=[1, 1],
-                            strides=[1, 1],
-                            name=node.name,
-                        )
-
-                        nodes_to_remove.append(node)
-                        init_to_remove.extend([node.input[1], node.input[2], node.input[3], node.input[4]])
-                        onnx_model.model.graph.node.append(new_node)
-                        logger.info(f"Found BatchNormalization node {node.name}. Replacing with Conv.")
-                    except Exception as e:
-                        logger.warning(
-                            f"Fail to generate conv's weights and bias beacuse of {e}, skip converting bn to conv"
-                        )
+                    new_node = onnx.helper.make_node(
+                        "Conv",
+                        inputs=[node.input[0],
+                                node.output[0] + "_bn2conv_w",
+                                node.output[0] + "_bn2conv_b"],
+                        outputs=[node.output[0]],
+                        group=num_ch,
+                        kernel_shape=[1, 1],
+                        strides=[1, 1],
+                        name=node.name,
+                    )
                 else:
-                    logger.warning(
-                        f"Fail to convert bn {node.name} to conv beacuse BatchNormalization's input or shape does not meet the requirements"
+                    # 1D: depthwise Conv1d(kernel=1).
+                    w_tensor = onnx.numpy_helper.from_array(
+                        w.reshape(num_ch, 1, 1).astype(np.float32),
+                        name=node.output[0] + "_bn2conv_w",
                     )
+                    new_node = onnx.helper.make_node(
+                        "Conv",
+                        inputs=[node.input[0],
+                                node.output[0] + "_bn2conv_w",
+                                node.output[0] + "_bn2conv_b"],
+                        outputs=[node.output[0]],
+                        group=num_ch,
+                        kernel_shape=[1],
+                        strides=[1],
+                        name=node.name,
+                    )
+
+                b_tensor = onnx.numpy_helper.from_array(
+                    b.astype(np.float32),
+                    name=node.output[0] + "_bn2conv_b",
+                )
+                onnx_model.model.graph.initializer.extend([w_tensor, b_tensor])
+                onnx_model.model.graph.node.append(new_node)
+                nodes_to_remove.append(node)
+                init_to_remove.extend(node.input[1:])
+                dim_label = "2D Conv(1×1)" if len(input_shape) == 4 else "1D Conv(kernel=1)"
+                logger.info(
+                    f"Found BatchNormalization node {node.name}. "
+                    f"Replacing with depthwise {dim_label}."
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Fail to generate conv weights/bias for {node.name}: {exc}. "
+                    "Skipping BN-to-Conv conversion."
+                )
+
         onnx_model.remove_nodes(nodes_to_remove)
         onnx_model.remove_initializers(init_to_remove)
         onnx_model.clean_initializers()
@@ -157,31 +197,91 @@ class Optimizer:
     def convert_reduce_mean_to_global_avg_pool(self) -> None:
         """Convert ReduceMean to GlobalAveragePool."""
 
+        def _check_reduce_mean_1d(model, node):
+            """Return True if this ReduceMean reduces only over axis 2 (any keepdims value)."""
+            # axes as attribute (opset ≤ 17 style, also used by PyTorch at opset 21)
+            has_axes_attr = any(attr.name == "axes" for attr in node.attribute)
+            if has_axes_attr:
+                return any(
+                    attr.name == "axes" and list(attr.ints) == [2]
+                    for attr in node.attribute
+                )
+            # axes as second input tensor (opset 18+ style)
+            if len(node.input) == 2:
+                for init in model.graph.initializer:
+                    if init.name == node.input[1]:
+                        axes = onnx.numpy_helper.to_array(init).tolist()
+                        if axes == [2]:
+                            return True
+            return False
+
+        def _get_keepdims(node):
+            """Return the keepdims attribute value (ONNX default is 1)."""
+            for attr in node.attribute:
+                if attr.name == "keepdims":
+                    return int(attr.i)
+            return 1  # ONNX default
+
         nodes_to_remove = []
         onnx_model = ONNXModel(self.model)
-        for node in onnx_model.model.graph.node:
-            if (
-                node.op_type == "ReduceMean"
-                and check_reduce_mean_condition(onnx_model.model, node)
-                and self.should_quantize_node(node)
-            ):
-                if len(node.input) == 1:
-                    new_node = self.replace_node_with(node, "GlobalAveragePool")
-                    nodes_to_remove.append(node)
-                    logger.info(
-                        f"Found ReduceMean node {node.name} with axes=[2, 3]. Replacing with GlobalAveragePool."
-                    )
-                # Handling opset >= 18 for Reduce Mean
-                elif len(node.input) == 2:
-                    new_node = onnx.helper.make_node(
-                        "GlobalAveragePool", inputs=[node.input[0]], outputs=node.output, name=node.name
-                    )
 
-                    nodes_to_remove.append(node)
-                    onnx_model.model.graph.node.append(new_node)
-                    logger.info(
-                        f"Found ReduceMean node {node.name} with axes=[2, 3]. Replacing with GlobalAveragePool."
+        for node in onnx_model.model.graph.node:
+            if node.op_type != "ReduceMean" or not self.should_quantize_node(node):
+                continue
+
+            is_2d = check_reduce_mean_condition(onnx_model.model, node)
+            is_1d = _check_reduce_mean_1d(onnx_model.model, node)
+            if not (is_2d or is_1d):
+                continue
+
+            dim_label = "axes=[2]" if is_1d else "axes=[2, 3]"
+            keepdims = _get_keepdims(node)
+            data_input = node.input[0]
+            node_base_name = node.name or node.output[0]
+
+            if keepdims == 1:
+                # Direct replacement: GAP output shape == ReduceMean output shape.
+                new_node = onnx.helper.make_node(
+                    "GlobalAveragePool",
+                    inputs=[data_input],
+                    outputs=list(node.output),
+                    name=node_base_name,
+                )
+                nodes_to_remove.append(node)
+                onnx_model.model.graph.node.append(new_node)
+            else:
+                # keepdims=0: GAP outputs (N,C,1) or (N,C,1,1) but the original node outputs (N,C).
+                # Insert GAP → Squeeze to restore the dropped dimension.
+                gap_out = node.output[0] + "_gap_kd1"
+                squeeze_axes_name = node.output[0] + "_squeeze_axes"
+
+                gap_node = onnx.helper.make_node(
+                    "GlobalAveragePool",
+                    inputs=[data_input],
+                    outputs=[gap_out],
+                    name=node_base_name + "_gap",
+                )
+                # Squeeze axis 2 (the trailing 1-element dim produced by GAP).
+                squeeze_axes = [2] if is_1d else [2, 3]
+                squeeze_axes_init = onnx.numpy_helper.from_array(
+                        np.array(squeeze_axes, dtype=np.int64), name=squeeze_axes_name
                     )
+                squeeze_node = onnx.helper.make_node(
+                    "Squeeze",
+                    inputs=[gap_out, squeeze_axes_name],
+                    outputs=list(node.output),
+                    name=node_base_name + "_squeeze",
+                )
+                nodes_to_remove.append(node)
+                onnx_model.model.graph.node.append(gap_node)
+                onnx_model.model.graph.node.append(squeeze_node)
+                onnx_model.model.graph.initializer.append(squeeze_axes_init)
+
+            logger.info(
+                f"Found ReduceMean {node.name} with {dim_label} (keepdims={keepdims}). "
+                "Replacing with GlobalAveragePool."
+            )
+
         onnx_model.remove_nodes(nodes_to_remove)
         onnx_model.clean_initializers()
         onnx_model.topological_sort()
@@ -204,49 +304,89 @@ class Optimizer:
             return int(factor_1), int(factor_2)
 
         onnx_model = ONNXModel(self.model)
+
         for node in onnx_model.model.graph.node:
-            if node.op_type == "GlobalAveragePool" and self.should_quantize_node(node):
-                input_name = node.input[0]
-                kw = None
-                kh = None
-                for input_info in onnx_model.model.graph.value_info:
-                    if input_info.name == input_name:
-                        input_shape = [dim.dim_value for dim in input_info.type.tensor_type.shape.dim]
-                        if len(input_shape) == 4:
-                            kh = input_shape[2]
-                            kw = input_shape[3]
-                        break
-                if not kw or not kh:
-                    logger.warning(f"Failed to get the input shape, skip optimizing for GlobalAveragePool {node.name}.")
+            if node.op_type != "GlobalAveragePool" or not self.should_quantize_node(node):
+                continue
+
+            input_name = node.input[0]
+            input_shape = None
+            for info in onnx_model.model.graph.value_info:
+                if info.name == input_name:
+                    input_shape = [dim.dim_value for dim in info.type.tensor_type.shape.dim]
+                    break
+
+            if input_shape is None:
+                logger.warning(f"Failed to get the input shape, skip optimizing for GlobalAveragePool {node.name}.")
+                continue
+
+            if len(input_shape) == 4:
+                # 2D case (original logic)
+                kh, kw = input_shape[2], input_shape[3]
+                if not kh or not kw or kh * kw <= 512:
                     continue
-                # Only one split is supported.
-                # TODO: Support multiple split operations
-                elif kw * kh > 512:
-                    kh1, kh2 = _get_factors(kh)
-                    kw1, kw2 = _get_factors(kw)
-                    if kh1 * kw1 > 512 or kh2 * kw2 > 512:
-                        logger.warning(
-                            "After split, the kernel size is still too large."
-                            "Currently, only one split is supported. Skip optimization."
-                        )
-                    else:
-                        split_tensor = node.input[0] + "_Split"
-                        pool_node = onnx.helper.make_node(
-                            "AveragePool",
-                            inputs=[node.input[0]],
-                            outputs=[split_tensor],
-                            kernel_shape=[kh1, kw1],
-                            strides=[kh1, kw1],
-                            name=split_tensor,
-                        )
-                        if not node.name:
-                            node.name = node.output[0]
-                        node.input[0] = split_tensor
-                        onnx_model.model.graph.node.extend([pool_node])
-                        logger.info(
-                            f"Found GlobalAveragePool node {node.name} with large kernel size. "
-                            f"Split it into multiple AveragePools."
-                        )
+                kh1, kh2 = _get_factors(kh)
+                kw1, kw2 = _get_factors(kw)
+                if kh1 * kw1 > 512 or kh2 * kw2 > 512:
+                    logger.warning(
+                        f"GlobalAveragePool {node.name}: after split kernel is still > 512. "
+                        "Only one split is supported. Skipping."
+                    )
+                    continue
+                split_tensor = node.input[0] + "_Split"
+                pool_node = onnx.helper.make_node(
+                    "AveragePool",
+                    inputs=[node.input[0]],
+                    outputs=[split_tensor],
+                    kernel_shape=[kh1, kw1],
+                    strides=[kh1, kw1],
+                    name=split_tensor,
+                )
+                if not node.name:
+                    node.name = node.output[0]
+                node.input[0] = split_tensor
+                onnx_model.model.graph.node.extend([pool_node])
+                logger.info(
+                    f"GlobalAveragePool {node.name}: split 2D kernel [{kh},{kw}] "
+                    f"into AveragePool [{kh1},{kw1}] + GlobalAveragePool [{kh2},{kw2}]."
+                )
+
+            elif len(input_shape) == 3:
+                # 1D case (new)
+                kl = input_shape[2]
+                if not kl or kl <= 512:
+                    continue
+                k1, k2 = _get_factors(kl)
+                if k1 > 512 or k2 > 512:
+                    logger.warning(
+                        f"GlobalAveragePool {node.name}: after split 1D kernel [{k1},{k2}] "
+                        "is still > 512. Only one split is supported. Skipping."
+                    )
+                    continue
+                split_tensor = node.input[0] + "_Split"
+                pool_node = onnx.helper.make_node(
+                    "AveragePool",
+                    inputs=[node.input[0]],
+                    outputs=[split_tensor],
+                    kernel_shape=[k1],
+                    strides=[k1],
+                    name=split_tensor,
+                )
+                if not node.name:
+                    node.name = node.output[0]
+                node.input[0] = split_tensor
+                onnx_model.model.graph.node.extend([pool_node])
+                logger.info(
+                    f"GlobalAveragePool {node.name}: split 1D kernel [{kl}] "
+                    f"into AveragePool [{k1}] + GlobalAveragePool [{k2}]."
+                )
+
+            else:
+                logger.warning(
+                    f"GlobalAveragePool {node.name}: unsupported input rank "
+                    f"{len(input_shape)}, skipping."
+                )
+
         onnx_model.clean_initializers()
         onnx_model.topological_sort()
         self.model = onnx_model.model
@@ -559,20 +699,18 @@ class Optimizer:
             bn_var: NDArray[np.float32],
             bn_epsilon: float,
         ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
-            if bn_gamma is not None:
-                multiplier = bn_gamma / np.sqrt(bn_var + bn_epsilon)
-            else:
-                multiplier = 1 / np.sqrt(bn_var + bn_epsilon)
+            multiplier = bn_gamma / np.sqrt(bn_var + bn_epsilon) if bn_gamma is not None \
+                else 1 / np.sqrt(bn_var + bn_epsilon)
 
             if target_type == "Gemm":
                 bn_weight = np.diag(multiplier)
             elif target_type == "ConvTranspose":
-                bn_weight = multiplier.reshape(1, len(multiplier), 1, 1)
+                # ConvTranspose weights: [in, out/group, k...]
+                # Conv1DTranspose (ndim=3) → [1, out/group, 1]
+                # Conv2DTranspose (ndim=4) → [1, out/group, 1, 1]  (unchanged)
+                bn_weight = multiplier.reshape([1, len(multiplier)] + [1] * (target_weight.ndim - 2))
 
-            if bn_beta is not None:
-                bn_bias = bn_beta + (-bn_mean) * multiplier
-            else:
-                bn_bias = (-bn_mean) * multiplier
+            bn_bias = bn_beta + (-bn_mean) * multiplier if bn_beta is not None else (-bn_mean) * multiplier
 
             if target_type == "Gemm":
                 folded_weight = np.dot(bn_weight, target_weight)
@@ -776,9 +914,15 @@ class Optimizer:
             if target_type == "Gemm":
                 bn_weight = np.diag(multiplier)
             elif target_type == "ConvTranspose":
-                bn_weight = multiplier.reshape(1, len(multiplier), 1, 1)
+                # ConvTranspose weights are [in, out/group, k...], multiplier spans out/group.
+                # Conv1DTranspose (ndim=3): reshape to [1, out/group, 1]
+                # Conv2DTranspose (ndim=4): reshape to [1, out/group, 1, 1]  (unchanged)
+                bn_weight = multiplier.reshape([1, len(multiplier)] + [1] * (target_weight.ndim - 2))
             elif target_type == "Conv":
-                bn_weight = multiplier.reshape(len(multiplier), 1, 1, 1)
+                # Conv weights are [out, in/group, k...], multiplier spans out.
+                # Conv1D (ndim=3): reshape to [out, 1, 1]
+                # Conv2D (ndim=4): reshape to [out, 1, 1, 1]  (unchanged)
+                bn_weight = multiplier.reshape([len(multiplier)] + [1] * (target_weight.ndim - 1))
 
             if bn_beta is not None:
                 bn_bias = bn_beta[start:end] + (-bn_mean[start:end]) * multiplier
